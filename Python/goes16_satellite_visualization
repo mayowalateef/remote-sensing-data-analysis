@@ -1,0 +1,147 @@
+# I'm installing all the necessary packages for satellite data processing and visualization
+%pip install metpy cartopy netCDF4 siphon scipy numpy matplotlib
+
+from datetime import datetime
+
+# I'm setting up the parameters for the satellite data I want to download
+image_date = datetime.utcnow().date()  # I'm using today's date in UTC time
+region = 'CONUS'  # I'm selecting the Continental United States region
+channel = 8  # I'm choosing Channel 8, which is the water vapor channel
+
+# I'm constructing the URL to access NOAA's THREDDS data server
+# This URL points to the catalog of GOES-16 satellite imagery
+data_url = ('https://thredds.ucar.edu/thredds/catalog/satellite/goes/east/products/'
+            f'CloudAndMoistureImagery/{region}/Channel{channel:02d}/'
+            f'{image_date:%Y%m%d}/catalog.xml')
+
+# I'm printing the URL to verify it's correct before accessing it
+print(data_url)
+
+from siphon.catalog import TDSCatalog
+
+# I'm connecting to the THREDDS catalog to see what datasets are available
+cat = TDSCatalog(data_url)
+
+# I'm displaying the first 5 datasets to see what's available
+cat.datasets[:5]
+
+# I'm selecting the second dataset from the catalog (index 1)
+dataset = cat.datasets[1]
+
+# I'm printing the dataset information to see what I've selected
+print(dataset)
+
+# I'm opening the dataset using xarray for easy data manipulation
+ds = dataset.remote_access(use_xarray=True)
+
+# I'm displaying the dataset structure to understand what variables it contains
+ds
+
+import metpy
+
+# I'm parsing the satellite imagery data with proper metadata using MetPy
+dat = ds.metpy.parse_cf('Sectorized_CMI')  # CMI = Cloud and Moisture Imagery
+# I'm extracting the map projection information so I can plot it correctly
+proj = dat.metpy.cartopy_crs
+# I'm getting the x and y coordinates for the image extent
+x = dat['x']
+y = dat['y']
+
+# === PLOTTING THE DATA ===
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.pyplot as plt
+%matplotlib inline
+
+# I'm creating a large figure (10x10 inches) for the first basic plot
+fig = plt.figure(figsize=(10, 10))
+# I'm creating an axis with the satellite's native projection
+ax = fig.add_subplot(1, 1, 1, projection=proj)
+
+# I'm adding geographic features to make the map readable
+ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=2)  # Coastlines
+ax.add_feature(cfeature.STATES.with_scale('50m'), linestyle=':', edgecolor='black')  # State borders
+ax.add_feature(cfeature.BORDERS.with_scale('50m'), linewidth=2, edgecolor='black')  # Country borders
+
+# I'm displaying the satellite image with the correct geographic extent
+im = ax.imshow(dat, extent=(x.min(), x.max(), y.min(), y.max()), origin='upper')
+
+# I'm adding my name as a watermark in the bottom left corner with a black background
+ax.text(0, 0, 'mayowa lateef', transform=ax.transAxes,
+        fontsize=12, color='white', ha='left', va='bottom',
+        bbox=dict(boxstyle='round,pad=0.5', fc='black', alpha=0.5))
+
+# === ENHANCED PLOT WITH PROPER COLOR SCHEME ===
+
+from metpy.plots import colortables
+from metpy.plots import add_timestamp
+
+# I'm creating another figure for an improved version with proper meteorological colors
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(1, 1, 1, projection=proj)
+
+# I'm adding the same geographic features as before
+ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=2)
+ax.add_feature(cfeature.STATES.with_scale('50m'), linestyle=':', edgecolor='black')
+ax.add_feature(cfeature.BORDERS.with_scale('50m'), linewidth=2, edgecolor='black')
+
+# I'm displaying the satellite image again
+im = ax.imshow(dat, extent=(x.min(), x.max(), y.min(), y.max()), origin='upper')
+
+# I'm applying the standard water vapor color scheme used by meteorologists
+wv_cmap = colortables.get_colortable('WVCIMSS_r')
+im.set_cmap(wv_cmap)
+
+# I'm parsing the image timestamp from the dataset metadata
+start_time = datetime.strptime(ds.start_date_time, '%Y%j%H%M%S')
+# I'm adding a professional timestamp to the plot showing when the image was captured
+add_timestamp(ax, time=start_time, pretext=f'GOES-16 Ch. {channel} ',
+              high_contrast=True, fontsize=16, y=0.01)
+
+# I'm adding my watermark again
+ax.text(0, 0, 'mayowa lateef', transform=ax.transAxes,
+        fontsize=12, color='white', ha='left', va='bottom',
+        bbox=dict(boxstyle='round,pad=0.5', fc='black', alpha=0.5))
+
+plt.show()
+
+# === ANALYZING THE DATA DISTRIBUTION ===
+
+import matplotlib.pyplot as plt
+
+# I'm creating a histogram to see the distribution of brightness temperature values
+# This helps me understand the range of data I'm working with
+plt.hist(ds['Sectorized_CMI'].to_masked_array().compressed(), bins=255);
+
+# === FINAL PLOT WITH OPTIMIZED COLOR RANGE ===
+
+# I'm creating a final version with an optimized color scale based on the histogram
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(1, 1, 1, projection=proj)
+
+# I'm adding geographic features
+ax.add_feature(cfeature.COASTLINE.with_scale('50m'), linewidth=2)
+ax.add_feature(cfeature.STATES.with_scale('50m'), linestyle=':', edgecolor='black')
+ax.add_feature(cfeature.BORDERS.with_scale('50m'), linewidth=2, edgecolor='black')
+
+# I'm displaying the image
+im = ax.imshow(dat, extent=(x.min(), x.max(), y.min(), y.max()), origin='upper')
+
+# I'm applying the water vapor color scheme with a specific temperature range (195-265 Kelvin)
+# This range enhances the contrast for water vapor features
+wv_norm, wv_cmap = colortables.get_with_range('WVCIMSS_r', 195, 265)
+im.set_cmap(wv_cmap)
+im.set_norm(wv_norm)
+
+# I'm adding the timestamp
+start_time = datetime.strptime(ds.start_date_time, '%Y%j%H%M%S')
+add_timestamp(ax, time=start_time, pretext=f'GOES-16 Ch. {channel} ',
+              high_contrast=True, fontsize=16, y=0.01)
+
+# I'm adding my watermark one last time
+ax.text(0, 0, 'mayowa lateef', transform=ax.transAxes,
+        fontsize=12, color='white', ha='left', va='bottom',
+        bbox=dict(boxstyle='round,pad=0.5', fc='black', alpha=0.5))
+
+plt.show()
