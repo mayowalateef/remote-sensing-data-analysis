@@ -1,0 +1,1510 @@
+// Enhanced Multitemporal Analysis of Vegetation (2000-2025) - 
+// Interactive visualization with multiple polygons support + LAI + Legend
+// Modified for Italian seasonal patterns with improved visualization
+// Original by Mayowa Lateef for Geocart S.P.A
+// Mayowa Lateef internship project for EOSAT Masters 
+
+// ================================
+// 1. CONFIGURATION AND PARAMETERS
+// ================================
+
+// Define study period
+var startYear = 2002; // Changed to 2002 to accommodate LAI data
+var endYear = 2025;
+
+// Define seasonal months for Italy
+var winterMonth = 1;   // January (Winter)
+var springMonth = 4;   // April (Spring)
+var summerMonth = 7;   // July (Summer)
+var autumnMonth = 10;  // October (Autumn)
+
+// Global variables for polygon management
+var polygonCounter = 0;
+var activePolygons = {};
+var selectedPolygonId = null;
+
+// Visualization parameters
+var ndviVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    'ffffff', 'ce7e45', 'df923d', 'f1b555', 'fcd163', '99b718', '74a901',
+    '66a000', '529400', '3e8601', '207401', '056201', '004c00', '023b01',
+    '012e01', '011d01', '011301'
+  ]
+};
+
+var eviVis = {
+  min: 0,
+  max: 1,
+  palette: [
+    'ffffff', 'ce7e45', 'df923d', 'f1b555', 'fcd163', '99b718', '74a901',
+    '66a000', '529400', '3e8601', '207401', '056201', '004c00', '023b01',
+    '012e01', '011d01', '011301'
+  ]
+};
+
+var laiVis = {
+  min: 0,
+  max: 7,
+  palette: [
+    'ffffff', 'fcd163', '99b718', '74a901', '66a000', '529400', '3e8601',
+    '207401', '056201', '004c00', '023b01', '012e01', '011d01', '011301'
+  ]
+};
+
+var dsmVis = {
+  min: 0,
+  max: 3000,
+  palette: [
+    '000080', '2A3095', '4E69AA', '6C8CD4', '87A6E0', 'A7C6EB', 'C9DCEB',
+    'FFFFFF', 'FFF0CC', 'FFC480', 'FF8C00', 'DC143C', 'B22222', '8B0000',
+    '660000', '4d0000', '330000'
+  ]
+};
+
+// Polygon colors for visualization
+var polygonColors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'cyan', 'magenta'];
+
+// ================================
+// 2. DATA PREPARATION FUNCTIONS
+// ================================
+
+function createDateRange(year, month) {
+  var start = ee.Date.fromYMD(year, month, 1);
+  var end = start.advance(1, 'month');
+  return [start, end];
+}
+
+function getModisData(year, month) {
+  var dateRange = createDateRange(year, month);
+  var start = dateRange[0];
+  var end = dateRange[1];
+  
+  var modisCollection = ee.ImageCollection('MODIS/061/MOD13Q1')
+    .filterDate(start, end)
+    .select(['NDVI', 'EVI']);
+    
+  var count = modisCollection.size();
+  
+  var modis = ee.Algorithms.If(
+    count.gt(0),
+    modisCollection.mean().multiply(0.0001),
+    ee.Image.constant([0, 0]).select([0, 1], ['NDVI', 'EVI']).mask(0)
+  );
+  
+  var timeStamp = ee.Date.fromYMD(year, month, 15);
+  var seasonName = getSeasonName(month);
+    
+  return ee.Image(modis)
+    .set('year', year)
+    .set('month', month)
+    .set('season', seasonName)
+    .set('system:time_start', timeStamp.millis());
+}
+
+function getLAIData(year, month) {
+  var dateRange = createDateRange(year, month);
+  var start = dateRange[0];
+  var end = dateRange[1];
+  
+  var laiCollection = ee.ImageCollection('MODIS/061/MCD15A3H')
+    .filterDate(start, end)
+    .select(['Lai']);
+    
+  var count = laiCollection.size();
+  
+  var lai = ee.Algorithms.If(
+    count.gt(0),
+    laiCollection.mean().multiply(0.1), // LAI scale factor
+    ee.Image.constant(0).select([0], ['Lai']).mask(0)
+  );
+  
+  var timeStamp = ee.Date.fromYMD(year, month, 15);
+  var seasonName = getSeasonName(month);
+    
+  return ee.Image(lai)
+    .set('year', year)
+    .set('month', month)
+    .set('season', seasonName)
+    .set('system:time_start', timeStamp.millis());
+}
+
+function getSeasonName(month) {
+  if (month === winterMonth) return 'Winter';
+  if (month === springMonth) return 'Spring';
+  if (month === summerMonth) return 'Summer';
+  if (month === autumnMonth) return 'Autumn';
+  return 'Unknown';
+}
+
+function getDSMData() {
+  return ee.Image('USGS/SRTMGL1_003').select('elevation');
+}
+
+// ================================
+// 3. POLYGON MANAGEMENT FUNCTIONS
+// ================================
+
+function addPolygon(geometry, name) {
+  polygonCounter++;
+  var polygonId = 'polygon_' + polygonCounter;
+  var polygonName = name || 'ROI ' + polygonCounter;
+  var color = polygonColors[(polygonCounter - 1) % polygonColors.length];
+  
+  // Store polygon data
+  activePolygons[polygonId] = {
+    geometry: geometry,
+    name: polygonName,
+    color: color,
+    layer: null
+  };
+  
+  // Add to map
+  var layer = Map.addLayer(geometry, {color: color}, polygonName, true, 0.5);
+  activePolygons[polygonId].layer = layer;
+  
+  // Update polygon selector
+  updatePolygonSelector();
+  
+  // Set as active polygon
+  selectedPolygonId = polygonId;
+  polygonSelect.setValue(polygonId);
+  
+  updateAppMessage('✅ Added ' + polygonName + ' (ID: ' + polygonId + ')');
+  
+  return polygonId;
+}
+
+function removePolygon(polygonId) {
+  if (activePolygons[polygonId]) {
+    // Remove layer from map
+    if (activePolygons[polygonId].layer) {
+      Map.layers().remove(activePolygons[polygonId].layer);
+    }
+    
+    // Remove from active polygons
+    delete activePolygons[polygonId];
+    
+    // Update selector
+    updatePolygonSelector();
+    
+    // Clear selection if this was selected
+    if (selectedPolygonId === polygonId) {
+      selectedPolygonId = null;
+      var remainingIds = Object.keys(activePolygons);
+      if (remainingIds.length > 0) {
+        selectedPolygonId = remainingIds[0];
+        polygonSelect.setValue(selectedPolygonId);
+      }
+    }
+    
+    updateAppMessage('🗑️ Removed polygon: ' + polygonId);
+  }
+}
+
+function updatePolygonSelector() {
+  var polygonIds = Object.keys(activePolygons);
+  var items = polygonIds.map(function(id) {
+    return {label: activePolygons[id].name, value: id};
+  });
+  
+  if (items.length === 0) {
+    items.push({label: 'No polygons drawn', value: null});
+  }
+  
+  polygonSelect.items().reset(items);
+  
+  // Update polygon list display
+  updatePolygonList();
+}
+
+function updatePolygonList() {
+  // Clear existing list
+  polygonListPanel.clear();
+  
+  var polygonIds = Object.keys(activePolygons);
+  
+  if (polygonIds.length === 0) {
+    polygonListPanel.add(ui.Label('No polygons drawn yet. Use drawing tools to create ROI.'));
+    return;
+  }
+  
+  polygonIds.forEach(function(polygonId) {
+    var polygon = activePolygons[polygonId];
+    
+    var polygonPanel = ui.Panel({
+      layout: ui.Panel.Layout.flow('horizontal'),
+      style: {margin: '2px 0px'}
+    });
+    
+    var colorBox = ui.Label('●', {
+      color: polygon.color,
+      fontSize: '16px',
+      margin: '0px 5px 0px 0px'
+    });
+    
+    var nameLabel = ui.Label(polygon.name, {
+      fontSize: '12px',
+      margin: '0px 10px 0px 0px'
+    });
+    
+    var selectBtn = ui.Button('Select', function() {
+      selectedPolygonId = polygonId;
+      polygonSelect.setValue(polygonId);
+      updateVisualization();
+    }, false, {fontSize: '10px', margin: '0px 5px'});
+    
+    var deleteBtn = ui.Button('✕', function() {
+      removePolygon(polygonId);
+    }, false, {
+      fontSize: '10px',
+      color: 'red',
+      margin: '0px',
+      padding: '2px 6px'
+    });
+    
+    polygonPanel.add(colorBox);
+    polygonPanel.add(nameLabel);
+    polygonPanel.add(selectBtn);
+    polygonPanel.add(deleteBtn);
+    
+    polygonListPanel.add(polygonPanel);
+  });
+}
+
+// ================================
+// 4. CREATE TIME SERIES COLLECTIONS
+// ================================
+
+var winterCollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getModisData(year, winterMonth);
+  })
+);
+
+var springCollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getModisData(year, springMonth);
+  })
+);
+
+var summerCollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getModisData(year, summerMonth);
+  })
+);
+
+var autumnCollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getModisData(year, autumnMonth);
+  })
+);
+
+// LAI Collections
+var winterLAICollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getLAIData(year, winterMonth);
+  })
+);
+
+var springLAICollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getLAIData(year, springMonth);
+  })
+);
+
+var summerLAICollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getLAIData(year, summerMonth);
+  })
+);
+
+var autumnLAICollection = ee.ImageCollection(
+  ee.List.sequence(startYear, endYear).map(function(year) {
+    return getLAIData(year, autumnMonth);
+  })
+);
+
+var allSeasonCollection = winterCollection.merge(springCollection)
+                         .merge(summerCollection).merge(autumnCollection);
+                         
+var allLAICollection = winterLAICollection.merge(springLAICollection)
+                      .merge(summerLAICollection).merge(autumnLAICollection);
+
+var dsm = getDSMData();
+
+// ================================
+// 5. LEGEND CREATION FUNCTION
+// ================================
+
+function createLegend(variable) {
+  var legend = ui.Panel({
+    style: {
+      position: 'bottom-left',
+      padding: '8px 15px'
+    }
+  });
+  
+  var legendTitle = ui.Label({
+    value: variable + ' Legend',
+    style: {
+      fontWeight: 'bold',
+      fontSize: '16px',
+      margin: '0 0 4px 0',
+      padding: '0'
+    }
+  });
+  
+  legend.add(legendTitle);
+  
+  var vis = ndviVis; // default
+  var units = '';
+  var description = '';
+  
+  if (variable === 'NDVI') {
+    vis = ndviVis;
+    units = 'Index (0-1)';
+    description = 'Normalized Difference Vegetation Index';
+  } else if (variable === 'EVI') {
+    vis = eviVis;
+    units = 'Index (0-1)';
+    description = 'Enhanced Vegetation Index';
+  } else if (variable === 'LAI') {
+    vis = laiVis;
+    units = 'm²/m²';
+    description = 'Leaf Area Index';
+  } else if (variable === 'DSM') {
+    vis = dsmVis;
+    units = 'meters';
+    description = 'Digital Surface Model';
+  }
+  
+  legend.add(ui.Label({
+    value: description,
+    style: {fontSize: '12px', margin: '0 0 4px 0'}
+  }));
+  
+  legend.add(ui.Label({
+    value: 'Units: ' + units,
+    style: {fontSize: '11px', margin: '0 0 8px 0', fontStyle: 'italic'}
+  }));
+  
+  // Create colorbar
+  var colorBar = ui.Thumbnail({
+    image: ee.Image.pixelLonLat().select(0).multiply(vis.max - vis.min).add(vis.min),
+    params: {
+      bbox: [0, 0, 1, 0.1],
+      dimensions: '100x10',
+      format: 'png',
+      min: vis.min,
+      max: vis.max,
+      palette: vis.palette,
+    },
+    style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+  });
+  
+  var minLabel = ui.Label(vis.min.toFixed(1), {margin: '4px 8px'});
+  var maxLabel = ui.Label(vis.max.toFixed(1), {margin: '4px 8px'});
+  
+  var labelPanel = ui.Panel({
+    widgets: [minLabel, maxLabel],
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {stretch: 'horizontal', margin: '0px 0px', maxHeight: '30px'}
+  });
+  
+  legend.add(colorBar);
+  legend.add(labelPanel);
+  
+  return legend;
+}
+
+// ================================
+// 6. CREATE INTERACTIVE WIDGETS
+// ================================
+
+// Year slider
+var yearSlider = ui.Slider({
+  min: startYear,
+  max: endYear,
+  value: 2020,
+  step: 1,
+  style: {width: '300px'}
+});
+
+// Season selector
+var seasonSelect = ui.Select({
+  items: ['Winter', 'Spring', 'Summer', 'Autumn'],
+  value: 'Summer',
+  style: {width: '150px'}
+});
+
+// Variable selector (now includes LAI)
+var variableSelect = ui.Select({
+  items: ['NDVI', 'EVI', 'LAI', 'DSM'],
+  value: 'NDVI',
+  style: {width: '150px'}
+});
+
+// Polygon selector
+var polygonSelect = ui.Select({
+  items: [{label: 'No polygons drawn', value: null}],
+  value: null,
+  style: {width: '200px'}
+});
+
+// Labels
+var yearLabel = ui.Label('Year:');
+var seasonLabel = ui.Label('Season:');
+var variableLabel = ui.Label('Variable:');
+var polygonLabel = ui.Label('Active Polygon:');
+
+// App message area
+var appMessageArea = ui.Label('Welcome to MODIS Multi-Polygon Analysis Tool', {
+  fontSize: '12px',
+  color: 'blue',
+  whiteSpace: 'pre'
+});
+
+function updateAppMessage(message) {
+  appMessageArea.setValue(message);
+}
+
+// ================================
+// 7. DRAWING TOOLS SETUP
+// ================================
+
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(true);
+
+var drawInstructionBtn = ui.Button('📍 Drawing Instructions', function() {
+  showInstructions();
+}, false, {fontSize: '12px'});
+
+function showInstructions() {
+  var instructions = '🎯 DRAWING INSTRUCTIONS:\n' +
+    '1. Click the polygon tool (⬟) or rectangle tool (▢) in the map\n' +
+    '2. Click on the map to create polygon vertices\n' +
+    '3. Double-click to finish the polygon\n' +
+    '4. The polygon will automatically be added to your analysis\n' +
+    '5. You can draw multiple polygons for comparison\n\n' +
+    '📊 ANALYSIS FEATURES:\n' +
+    '• NDVI, EVI, LAI (2002-2025) and DSM analysis\n' +
+    '• Multi-polygon support with color coding\n' +
+    '• Italian seasonal patterns (Jan, Apr, Jul, Oct)\n' +
+    '• Time series charts and statistics\n' +
+    '• Interactive legend and basemap options';
+  
+  updateAppMessage(instructions);
+}
+
+drawingTools.onDraw(ui.util.debounce(function() {
+  try {
+    var layers = drawingTools.layers();
+    var layerCount = layers.length();
+    
+    if (layerCount > 0) {
+      var lastLayer = layers.get(layerCount - 1);
+      var drawnGeometry = lastLayer.getEeObject();
+      
+      var polygonId = addPolygon(drawnGeometry, 'ROI ' + (polygonCounter + 1));
+      
+      setTimeout(function() {
+        layers.remove(lastLayer);
+      }, 100);
+      
+      updateVisualization();
+    }
+  } catch (error) {
+    updateAppMessage('❌ Drawing error: ' + error + '\nPlease try drawing again or refresh the page');
+  }
+}, 500));
+
+drawingTools.onEdit(function() {
+  updateAppMessage('✏️ Geometry edited - updating visualization...');
+  updateVisualization();
+});
+
+// ================================
+// 8. VISUALIZATION UPDATE FUNCTION
+// ================================
+
+var currentLegend = null;
+
+function updateVisualization() {
+  var selectedYear = yearSlider.getValue();
+  var selectedSeason = seasonSelect.getValue();
+  var selectedVariable = variableSelect.getValue();
+  
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    infoLabel.setValue('Please draw or select a polygon to analyze');
+    return;
+  }
+  
+  var currentGeometry = activePolygons[selectedPolygonId].geometry;
+  var currentName = activePolygons[selectedPolygonId].name;
+  
+  // Clear previous data layers
+  var layers = Map.layers();
+  var layersToRemove = [];
+  for (var i = 0; i < layers.length(); i++) {
+    var layer = layers.get(i);
+    var layerName = layer.getName();
+    if (layerName.indexOf('NDVI') !== -1 || 
+        layerName.indexOf('EVI') !== -1 || 
+        layerName.indexOf('LAI') !== -1 ||
+        layerName.indexOf('DSM') !== -1) {
+      layersToRemove.push(layer);
+    }
+  }
+  
+  layersToRemove.forEach(function(layer) {
+    layers.remove(layer);
+  });
+  
+  // Remove existing legend
+  if (currentLegend) {
+    Map.remove(currentLegend);
+  }
+  
+  // Get month based on season
+  var selectedMonth = getMonthFromSeason(selectedSeason);
+  
+  // Add new layer based on selection
+  if (selectedVariable === 'DSM') {
+    var dsmClipped = dsm.clip(currentGeometry);
+    Map.addLayer(dsmClipped, dsmVis, 'DSM - ' + currentName, true, 1.0);
+    currentLegend = createLegend('DSM');
+    Map.add(currentLegend);
+  } else if (selectedVariable === 'LAI') {
+    var laiImage = allLAICollection
+      .filter(ee.Filter.eq('year', selectedYear))
+      .filter(ee.Filter.eq('month', selectedMonth))
+      .first();
+    
+    var laiClipped = laiImage.select('Lai').clip(currentGeometry);
+    Map.addLayer(laiClipped, laiVis, 
+      'LAI - ' + currentName + ' (' + selectedSeason + ' ' + selectedYear + ')', true, 1.0);
+    currentLegend = createLegend('LAI');
+    Map.add(currentLegend);
+  } else {
+    var image = allSeasonCollection
+      .filter(ee.Filter.eq('year', selectedYear))
+      .filter(ee.Filter.eq('month', selectedMonth))
+      .first();
+    
+    if (selectedVariable === 'NDVI') {
+      var ndviClipped = image.select('NDVI').clip(currentGeometry);
+      Map.addLayer(ndviClipped, ndviVis, 
+        'NDVI - ' + currentName + ' (' + selectedSeason + ' ' + selectedYear + ')', true, 1.0);
+      currentLegend = createLegend('NDVI');
+      Map.add(currentLegend);
+    } else if (selectedVariable === 'EVI') {
+      var eviClipped = image.select('EVI').clip(currentGeometry);
+      Map.addLayer(eviClipped, eviVis, 
+        'EVI - ' + currentName + ' (' + selectedSeason + ' ' + selectedYear + ')', true, 1.0);
+      currentLegend = createLegend('EVI');
+      Map.add(currentLegend);
+    }
+  }
+  
+  updateInfoPanel(selectedYear, selectedSeason, selectedVariable);
+}
+
+function getMonthFromSeason(season) {
+  if (season === 'Winter') return winterMonth;
+  if (season === 'Spring') return springMonth;
+  if (season === 'Summer') return summerMonth;
+  if (season === 'Autumn') return autumnMonth;
+  return summerMonth; // default
+}
+
+// ================================
+// 9. CHART FUNCTIONS (Enhanced with LAI)
+// ================================
+
+function createMeanChart(variable) {
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    updateAppMessage('❌ Please select a polygon first');
+    return;
+  }
+  
+  var currentGeometry = activePolygons[selectedPolygonId].geometry;
+  var currentName = activePolygons[selectedPolygonId].name;
+  
+  updateAppMessage('📊 Creating MEAN charts for ' + variable + ' - ' + currentName);
+  
+  if (variable === 'DSM') {
+    createDSMAnalysis('mean', currentGeometry, currentName);
+    return;
+  }
+  
+  var winterTimeSeries, springTimeSeries, summerTimeSeries, autumnTimeSeries;
+  
+  if (variable === 'LAI') {
+    winterTimeSeries = createLAITimeSeriesCollection('Winter');
+    springTimeSeries = createLAITimeSeriesCollection('Spring');
+    summerTimeSeries = createLAITimeSeriesCollection('Summer');
+    autumnTimeSeries = createLAITimeSeriesCollection('Autumn');
+  } else {
+    winterTimeSeries = createTimeSeriesCollection('Winter', variable);
+    springTimeSeries = createTimeSeriesCollection('Spring', variable);
+    summerTimeSeries = createTimeSeriesCollection('Summer', variable);
+    autumnTimeSeries = createTimeSeriesCollection('Autumn', variable);
+  }
+  
+  var winterChart = ui.Chart.image.series({
+    imageCollection: winterTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.mean(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Mean - ' + currentName + ' (Winter)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Mean'},
+      colors: ['blue'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  var springChart = ui.Chart.image.series({
+    imageCollection: springTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.mean(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Mean - ' + currentName + ' (Spring)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Mean'},
+      colors: ['green'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var summerChart = ui.Chart.image.series({
+    imageCollection: summerTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.mean(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Mean - ' + currentName + ' (Summer)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Mean'},
+      colors: ['red'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var autumnChart = ui.Chart.image.series({
+    imageCollection: autumnTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.mean(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Mean - ' + currentName + ' (Autumn)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Mean'},
+      colors: ['orange'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  initializeChartPanel();
+  
+  chartPanel.add(ui.Label('📊 ' + variable + ' Mean Charts - ' + currentName, {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '10px 0 5px 0'
+  }));
+  chartPanel.add(winterChart);
+  chartPanel.add(springChart);
+  chartPanel.add(summerChart);
+  chartPanel.add(autumnChart);
+  
+  activeCharts.push(winterChart, springChart, summerChart, autumnChart);
+}
+
+function createLAITimeSeriesCollection(season) {
+  var month = getMonthFromSeason(season);
+  
+  var collection = ee.ImageCollection(
+    ee.List.sequence(startYear, endYear).map(function(year) {
+      var date = ee.Date.fromYMD(year, month, 15);
+      var dateRange = createDateRange(year, month);
+      var start = dateRange[0];
+      var end = dateRange[1];
+      
+      var laiCollection = ee.ImageCollection('MODIS/061/MCD15A3H')
+        .filterDate(start, end)
+        .select(['Lai']);
+      
+      var image = ee.Algorithms.If(
+        laiCollection.size().gt(0),
+        laiCollection.mean().multiply(0.1).select('Lai'),
+        ee.Image.constant(0).rename('Lai').mask(0)
+      );
+      
+      return ee.Image(image)
+        .set('system:time_start', date.millis())
+        .set('year', year)
+        .set('month', month)
+        .set('season', season);
+    })
+  );
+  
+  return collection.filter(ee.Filter.listContains('system:band_names', 'Lai'));
+}
+
+function createTimeSeriesCollection(season, variable) {
+  var month = getMonthFromSeason(season);
+  
+  var collection = ee.ImageCollection(
+    ee.List.sequence(startYear, endYear).map(function(year) {
+      var date = ee.Date.fromYMD(year, month, 15);
+      var dateRange = createDateRange(year, month);
+      var start = dateRange[0];
+      var end = dateRange[1];
+      
+      var modisCollection = ee.ImageCollection('MODIS/061/MOD13Q1')
+        .filterDate(start, end)
+        .select(['NDVI', 'EVI']);
+      
+      var image = ee.Algorithms.If(
+        modisCollection.size().gt(0),
+        modisCollection.mean().multiply(0.0001).select(variable),
+        ee.Image.constant(0).rename(variable).mask(0)
+      );
+      
+      return ee.Image(image)
+        .set('system:time_start', date.millis())
+        .set('year', year)
+        .set('month', month)
+        .set('season', season);
+    })
+  );
+  
+  return collection.filter(ee.Filter.listContains('system:band_names', variable));
+}
+
+function createDSMAnalysis(statType, geometry, name) {
+  var dsmClipped = dsm.clip(geometry);
+  
+  if (statType === 'mean') {
+    var dsmHistogram = ui.Chart.image.histogram({
+      image: dsmClipped,
+      region: geometry,
+      scale: 30,
+      maxPixels: 1e6
+    }).setOptions({
+      title: 'DSM Elevation Distribution - ' + name,
+      hAxis: {title: 'Elevation (m)'},
+      vAxis: {title: 'Pixel Count'},
+      colors: ['brown'],
+      width: 350,
+      height: 250
+    });
+    
+    initializeChartPanel();
+    
+    chartPanel.add(ui.Label('📊 DSM Analysis - ' + name, {
+      fontWeight: 'bold',
+      fontSize: '14px',
+      margin: '10px 0 5px 0'
+    }));
+    chartPanel.add(dsmHistogram);
+    
+    activeCharts.push(dsmHistogram);
+    
+    var meanStats = dsmClipped.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: geometry,
+      scale: 30,
+      maxPixels: 1e9
+    });
+    meanStats.evaluate(function(result) {
+      updateAppMessage('📊 DSM Mean Elevation (' + name + '): ' + Math.round(result.elevation) + ' meters');
+    });
+    
+  } else if (statType === 'min') {
+    var minStats = dsmClipped.reduceRegion({
+      reducer: ee.Reducer.min(),
+      geometry: geometry,
+      scale: 30,
+      maxPixels: 1e9
+    });
+    minStats.evaluate(function(result) {
+      updateAppMessage('📊 DSM Minimum Elevation (' + name + '): ' + Math.round(result.elevation) + ' meters');
+    });
+    
+  } else if (statType === 'max') {
+    var maxStats = dsmClipped.reduceRegion({
+      reducer: ee.Reducer.max(),
+      geometry: geometry,
+      scale: 30,
+      maxPixels: 1e9
+    });
+    maxStats.evaluate(function(result) {
+      updateAppMessage('📊 DSM Maximum Elevation (' + name + '): ' + Math.round(result.elevation) + ' meters');
+    });
+  }
+}
+
+function createMinChart(variable) {
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    updateAppMessage('❌ Please select a polygon first');
+    return;
+  }
+  
+  var currentGeometry = activePolygons[selectedPolygonId].geometry;
+  var currentName = activePolygons[selectedPolygonId].name;
+  
+  updateAppMessage('📊 Creating MIN charts for ' + variable + ' - ' + currentName);
+  
+  if (variable === 'DSM') {
+    createDSMAnalysis('min', currentGeometry, currentName);
+    return;
+  }
+  
+  var winterTimeSeries, springTimeSeries, summerTimeSeries, autumnTimeSeries;
+  
+  if (variable === 'LAI') {
+    winterTimeSeries = createLAITimeSeriesCollection('Winter');
+    springTimeSeries = createLAITimeSeriesCollection('Spring');
+    summerTimeSeries = createLAITimeSeriesCollection('Summer');
+    autumnTimeSeries = createLAITimeSeriesCollection('Autumn');
+  } else {
+    winterTimeSeries = createTimeSeriesCollection('Winter', variable);
+    springTimeSeries = createTimeSeriesCollection('Spring', variable);
+    summerTimeSeries = createTimeSeriesCollection('Summer', variable);
+    autumnTimeSeries = createTimeSeriesCollection('Autumn', variable);
+  }
+  
+  var winterChart = ui.Chart.image.series({
+    imageCollection: winterTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.min(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Minimum - ' + currentName + ' (Winter)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Minimum'},
+      colors: ['lightblue'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  var springChart = ui.Chart.image.series({
+    imageCollection: springTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.min(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Minimum - ' + currentName + ' (Spring)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Minimum'},
+      colors: ['lightgreen'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var summerChart = ui.Chart.image.series({
+    imageCollection: summerTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.min(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Minimum - ' + currentName + ' (Summer)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Minimum'},
+      colors: ['lightcoral'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var autumnChart = ui.Chart.image.series({
+    imageCollection: autumnTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.min(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Minimum - ' + currentName + ' (Autumn)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Minimum'},
+      colors: ['moccasin'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  initializeChartPanel();
+  
+  chartPanel.add(ui.Label('📊 ' + variable + ' Min Charts - ' + currentName, {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '10px 0 5px 0'
+  }));
+  chartPanel.add(winterChart);
+  chartPanel.add(springChart);
+  chartPanel.add(summerChart);
+  chartPanel.add(autumnChart);
+  
+  activeCharts.push(winterChart, springChart, summerChart, autumnChart);
+}
+
+function createMaxChart(variable) {
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    updateAppMessage('❌ Please select a polygon first');
+    return;
+  }
+  
+  var currentGeometry = activePolygons[selectedPolygonId].geometry;
+  var currentName = activePolygons[selectedPolygonId].name;
+  
+  updateAppMessage('📊 Creating MAX charts for ' + variable + ' - ' + currentName);
+  
+  if (variable === 'DSM') {
+    createDSMAnalysis('max', currentGeometry, currentName);
+    return;
+  }
+  
+  var winterTimeSeries, springTimeSeries, summerTimeSeries, autumnTimeSeries;
+  
+  if (variable === 'LAI') {
+    winterTimeSeries = createLAITimeSeriesCollection('Winter');
+    springTimeSeries = createLAITimeSeriesCollection('Spring');
+    summerTimeSeries = createLAITimeSeriesCollection('Summer');
+    autumnTimeSeries = createLAITimeSeriesCollection('Autumn');
+  } else {
+    winterTimeSeries = createTimeSeriesCollection('Winter', variable);
+    springTimeSeries = createTimeSeriesCollection('Spring', variable);
+    summerTimeSeries = createTimeSeriesCollection('Summer', variable);
+    autumnTimeSeries = createTimeSeriesCollection('Autumn', variable);
+  }
+  
+  var winterChart = ui.Chart.image.series({
+    imageCollection: winterTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.max(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Maximum - ' + currentName + ' (Winter)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Maximum'},
+      colors: ['darkblue'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  var springChart = ui.Chart.image.series({
+    imageCollection: springTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.max(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Maximum - ' + currentName + ' (Spring)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Maximum'},
+      colors: ['darkgreen'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var summerChart = ui.Chart.image.series({
+    imageCollection: summerTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.max(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Maximum - ' + currentName + ' (Summer)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Maximum'},
+      colors: ['darkred'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+    
+  var autumnChart = ui.Chart.image.series({
+    imageCollection: autumnTimeSeries,
+    region: currentGeometry,
+    reducer: ee.Reducer.max(),
+    scale: 250,
+    xProperty: 'system:time_start'
+  }).setChartType('LineChart')
+    .setOptions({
+      title: variable + ' Maximum - ' + currentName + ' (Autumn)',
+      hAxis: {title: 'Year', format: 'YYYY'},
+      vAxis: {title: variable + ' Maximum'},
+      colors: ['darkorange'],
+      lineWidth: 2,
+      pointSize: 3,
+      width: 350,
+      height: 250
+    });
+  
+  initializeChartPanel();
+  
+  chartPanel.add(ui.Label('📊 ' + variable + ' Max Charts - ' + currentName, {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    margin: '10px 0 5px 0'
+  }));
+  chartPanel.add(winterChart);
+  chartPanel.add(springChart);
+  chartPanel.add(summerChart);
+  chartPanel.add(autumnChart);
+  
+  activeCharts.push(winterChart, springChart, summerChart, autumnChart);
+}
+
+function createAllCharts(variable) {
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    updateAppMessage('❌ Please select a polygon first');
+    return;
+  }
+  
+  var currentName = activePolygons[selectedPolygonId].name;
+  updateAppMessage('📊 Creating ALL charts for ' + variable + ' - ' + currentName);
+  
+  clearChartsFromPanel();
+  
+  createMeanChart(variable);
+  createMinChart(variable);
+  createMaxChart(variable);
+  
+  updateAppMessage('✅ All charts generated for ' + variable + ' - ' + currentName);
+}
+
+// Global variables for chart management
+var chartPanel = null;
+var activeCharts = [];
+
+function initializeChartPanel() {
+  if (!chartPanel) {
+    chartPanel = ui.Panel({
+      style: {width: '100%', padding: '5px'}
+    });
+    controlPanel.add(chartPanel);
+  }
+}
+
+function clearChartsFromPanel() {
+  if (chartPanel) {
+    chartPanel.clear();
+  }
+  activeCharts = [];
+}
+
+// ================================
+// 10. STATISTICS AND INFO PANEL
+// ================================
+
+function updateInfoPanel(year, season, variable) {
+  if (!selectedPolygonId || !activePolygons[selectedPolygonId]) {
+    infoLabel.setValue('Please draw or select a polygon to analyze');
+    return;
+  }
+  
+  var currentGeometry = activePolygons[selectedPolygonId].geometry;
+  var currentName = activePolygons[selectedPolygonId].name;
+  
+  if (variable === 'DSM') {
+    var stats = dsm.clip(currentGeometry).reduceRegion({
+      reducer: ee.Reducer.minMax().combine(ee.Reducer.mean(), '', true),
+      geometry: currentGeometry,
+      scale: 30,
+      maxPixels: 1e9
+    });
+    
+    stats.evaluate(function(result) {
+      if (result && result.elevation_min !== undefined) {
+        var infoText = 'DSM Statistics - ' + currentName + ':\n' +
+                       'Minimum: ' + Math.round(result.elevation_min) + ' m\n' +
+                       'Maximum: ' + Math.round(result.elevation_max) + ' m\n' +
+                       'Mean: ' + Math.round(result.elevation_mean) + ' m';
+        infoLabel.setValue(infoText);
+      } else {
+        infoLabel.setValue('DSM data not available for ' + currentName);
+      }
+    });
+  } else if (variable === 'LAI') {
+    var selectedMonth = getMonthFromSeason(season);
+    var laiImage = allLAICollection
+      .filter(ee.Filter.eq('year', year))
+      .filter(ee.Filter.eq('month', selectedMonth))
+      .first();
+    
+    var stats = laiImage.select('Lai').clip(currentGeometry).reduceRegion({
+      reducer: ee.Reducer.minMax().combine(ee.Reducer.mean(), '', true),
+      geometry: currentGeometry,
+      scale: 250,
+      maxPixels: 1e9
+    });
+    
+    stats.evaluate(function(result) {
+      if (result && result.Lai_min !== undefined) {
+        var infoText = 'LAI Statistics - ' + currentName + ':\n' +
+                       'Year: ' + year + '\n' +
+                       'Season: ' + season + '\n' +
+                       'Minimum: ' + (result.Lai_min || 0).toFixed(3) + ' m²/m²\n' +
+                       'Maximum: ' + (result.Lai_max || 0).toFixed(3) + ' m²/m²\n' +
+                       'Mean: ' + (result.Lai_mean || 0).toFixed(3) + ' m²/m²';
+        infoLabel.setValue(infoText);
+      } else {
+        infoLabel.setValue('LAI data not available for ' + currentName + ' in ' + season + ' ' + year);
+      }
+    });
+  } else {
+    var selectedMonth = getMonthFromSeason(season);
+    var image = allSeasonCollection
+      .filter(ee.Filter.eq('year', year))
+      .filter(ee.Filter.eq('month', selectedMonth))
+      .first();
+    
+    var stats = image.select(variable).clip(currentGeometry).reduceRegion({
+      reducer: ee.Reducer.minMax().combine(ee.Reducer.mean(), '', true),
+      geometry: currentGeometry,
+      scale: 250,
+      maxPixels: 1e9
+    });
+    
+    stats.evaluate(function(result) {
+      if (result && result[variable + '_min'] !== undefined) {
+        var infoText = variable + ' Statistics - ' + currentName + ':\n' +
+                       'Year: ' + year + '\n' +
+                       'Season: ' + season + '\n' +
+                       'Minimum: ' + (result[variable + '_min'] || 0).toFixed(3) + '\n' +
+                       'Maximum: ' + (result[variable + '_max'] || 0).toFixed(3) + '\n' +
+                       'Mean: ' + (result[variable + '_mean'] || 0).toFixed(3);
+        infoLabel.setValue(infoText);
+      } else {
+        infoLabel.setValue(variable + ' data not available for ' + currentName + ' in ' + season + ' ' + year);
+      }
+    });
+  }
+}
+
+// ================================
+// 11. UI SETUP AND LAYOUT
+// ================================
+
+var controlPanel = ui.Panel({
+  style: {width: '420px', padding: '10px'}
+});
+
+var title = ui.Label('Enhanced MODIS Multi-Polygon Analysis', 
+  {fontSize: '16px', fontWeight: 'bold'});
+
+var subtitle = ui.Label('Italian Seasons • NDVI • EVI • LAI • DSM', 
+  {fontSize: '12px', fontStyle: 'italic', color: 'gray'});
+
+var infoLabel = ui.Label('Draw polygons using map tools, then select parameters', 
+  {fontSize: '12px', whiteSpace: 'pre'});
+
+var controlsPanel = ui.Panel([
+  polygonLabel, polygonSelect,
+  ui.Label(''),
+  yearLabel, yearSlider,
+  seasonLabel, seasonSelect,
+  variableLabel, variableSelect
+], ui.Panel.Layout.flow('vertical'));
+
+var basemapSelect = ui.Select({
+  items: [
+    {label: 'Satellite', value: 'SATELLITE'},
+    {label: 'Hybrid (Satellite + Labels)', value: 'HYBRID'},
+    {label: 'Roadmap (Labels)', value: 'ROADMAP'},
+    {label: 'Terrain', value: 'TERRAIN'}
+  ],
+  value: 'HYBRID',
+  style: {width: '200px'},
+  onChange: function(selected) {
+    Map.setOptions(selected);
+  }
+});
+
+var basemapLabel = ui.Label('Basemap:');
+
+// Enhanced button layout
+var ndviChartsBtn = ui.Button('NDVI Charts', function() {
+  createAllCharts('NDVI');
+}, false, {width: '90px'});
+
+var eviChartsBtn = ui.Button('EVI Charts', function() {
+  createAllCharts('EVI');
+}, false, {width: '90px'});
+
+var laiChartsBtn = ui.Button('LAI Charts', function() {
+  createAllCharts('LAI');
+}, false, {width: '90px'});
+
+var dsmChartsBtn = ui.Button('DSM Stats', function() {
+  createAllCharts('DSM');
+}, false, {width: '90px'});
+
+var meanBtn = ui.Button('Mean', function() {
+  var variable = variableSelect.getValue();
+  clearChartsFromPanel();
+  createMeanChart(variable);
+}, false, {width: '60px'});
+
+var minBtn = ui.Button('Min', function() {
+  var variable = variableSelect.getValue();
+  clearChartsFromPanel();
+  createMinChart(variable);
+}, false, {width: '60px'});
+
+var maxBtn = ui.Button('Max', function() {
+  var variable = variableSelect.getValue();
+  clearChartsFromPanel();
+  createMaxChart(variable);
+}, false, {width: '60px'});
+
+var clearAllBtn = ui.Button('Clear All Polygons', function() {
+  var polygonIds = Object.keys(activePolygons);
+  polygonIds.forEach(function(id) {
+    removePolygon(id);
+  });
+  selectedPolygonId = null;
+  clearChartsFromPanel();
+  updateVisualization();
+  updateAppMessage('🗑️ All polygons cleared');
+}, false, {color: 'red'});
+
+var clearChartsBtn = ui.Button('Clear Charts', function() {
+  clearChartsFromPanel();
+  updateAppMessage('📊 Charts cleared');
+}, false, {color: 'orange'});
+
+// Information and help button
+var helpBtn = ui.Button('ℹ️ Help & Info', function() {
+  showAppInformation();
+}, false, {fontSize: '12px'});
+
+function showAppInformation() {
+  var info = '🌍 ENHANCED MODIS MULTI-POLYGON ANALYSIS TOOL\n' +
+    'Original by Mayowa Lateef for Geocart S.P.A\n\n' +
+    '📅 DATA COVERAGE:\n' +
+    '• NDVI/EVI: 2000-2025 (MODIS/061/MOD13Q1)\n' +
+    '• LAI: 2002-2025 (MODIS/061/MCD15A3H)\n' +
+    '• DSM: SRTM Global 30m (USGS/SRTMGL1_003)\n\n' +
+    '🏔️ ITALIAN SEASONS:\n' +
+    '• Winter: January\n' +
+    '• Spring: April  \n' +
+    '• Summer: July\n' +
+    '• Autumn: October\n\n' +
+    '🔧 FEATURES:\n' +
+    '• Multi-polygon support with color coding\n' +
+    '• Interactive legend for all variables\n' +
+    '• Time series analysis (2002-2025)\n' +
+    '• NDVI, EVI, LAI vegetation indices\n' +
+    '• Digital Surface Model analysis\n' +
+    '• Statistical summaries and charts\n' +
+    '• Italian seasonal pattern analysis\n\n' +
+    '📊 VARIABLES:\n' +
+    '• NDVI: Normalized Difference Vegetation Index (0-1)\n' +
+    '• EVI: Enhanced Vegetation Index (0-1)\n' +
+    '• LAI: Leaf Area Index (m²/m²)\n' +
+    '• DSM: Digital Surface Model (meters)\n\n' +
+    '💡 TIP: Use drawing tools to create polygons, then analyze with charts!';
+  
+  updateAppMessage(info);
+}
+
+var allButtonsPanel1 = ui.Panel([ndviChartsBtn, eviChartsBtn, laiChartsBtn, dsmChartsBtn], 
+  ui.Panel.Layout.flow('horizontal'));
+
+var statButtonPanel = ui.Panel([meanBtn, minBtn, maxBtn], 
+  ui.Panel.Layout.flow('horizontal'));
+
+var utilityButtonPanel = ui.Panel([clearChartsBtn, clearAllBtn], 
+  ui.Panel.Layout.flow('horizontal'));
+
+var polygonListPanel = ui.Panel([], ui.Panel.Layout.flow('vertical'));
+
+// Multi-polygon visualization button
+var visualizeAllBtn = ui.Button('Visualize All Polygons', function() {
+  visualizeAllPolygons();
+}, false, {width: '150px', fontSize: '12px'});
+
+function visualizeAllPolygons() {
+  var selectedYear = yearSlider.getValue();
+  var selectedSeason = seasonSelect.getValue();
+  var selectedVariable = variableSelect.getValue();
+  
+  var polygonIds = Object.keys(activePolygons);
+  
+  if (polygonIds.length === 0) {
+    updateAppMessage('❌ No polygons to visualize');
+    return;
+  }
+  
+  updateAppMessage('🎨 Visualizing ' + selectedVariable + ' for all ' + polygonIds.length + ' polygons');
+  
+  // Clear existing data layers first
+  var layers = Map.layers();
+  var layersToRemove = [];
+  for (var i = 0; i < layers.length(); i++) {
+    var layer = layers.get(i);
+    var layerName = layer.getName();
+    if (layerName.indexOf('NDVI') !== -1 || 
+        layerName.indexOf('EVI') !== -1 || 
+        layerName.indexOf('LAI') !== -1 ||
+        layerName.indexOf('DSM') !== -1) {
+      layersToRemove.push(layer);
+    }
+  }
+  
+  layersToRemove.forEach(function(layer) {
+    layers.remove(layer);
+  });
+  
+  // Remove existing legend
+  if (currentLegend) {
+    Map.remove(currentLegend);
+  }
+  
+  var selectedMonth = getMonthFromSeason(selectedSeason);
+  
+  polygonIds.forEach(function(polygonId) {
+    var polygon = activePolygons[polygonId];
+    var geometry = polygon.geometry;
+    var name = polygon.name;
+    
+    if (selectedVariable === 'DSM') {
+      var dsmClipped = dsm.clip(geometry);
+      Map.addLayer(dsmClipped, dsmVis, 'DSM - ' + name, true, 1.0);
+    } else if (selectedVariable === 'LAI') {
+      var laiImage = allLAICollection
+        .filter(ee.Filter.eq('year', selectedYear))
+        .filter(ee.Filter.eq('month', selectedMonth))
+        .first();
+      
+      var laiClipped = laiImage.select('Lai').clip(geometry);
+      Map.addLayer(laiClipped, laiVis, 
+        'LAI - ' + name + ' (' + selectedSeason + ')', true, 1.0);
+    } else {
+      var image = allSeasonCollection
+        .filter(ee.Filter.eq('year', selectedYear))
+        .filter(ee.Filter.eq('month', selectedMonth))
+        .first();
+      
+      if (selectedVariable === 'NDVI') {
+        var ndviClipped = image.select('NDVI').clip(geometry);
+        Map.addLayer(ndviClipped, ndviVis, 
+          'NDVI - ' + name + ' (' + selectedSeason + ')', true, 1.0);
+      } else if (selectedVariable === 'EVI') {
+        var eviClipped = image.select('EVI').clip(geometry);
+        Map.addLayer(eviClipped, eviVis, 
+          'EVI - ' + name + ' (' + selectedSeason + ')', true, 1.0);
+      }
+    }
+  });
+  
+  // Add legend for all polygons
+  currentLegend = createLegend(selectedVariable);
+  Map.add(currentLegend);
+  
+  updateAppMessage('✅ All polygons visualized with ' + selectedVariable);
+}
+
+// Assemble the control panel
+controlPanel.add(title);
+controlPanel.add(subtitle);
+controlPanel.add(ui.Label(''));
+controlPanel.add(appMessageArea);
+controlPanel.add(ui.Label(''));
+controlPanel.add(drawInstructionBtn);
+controlPanel.add(helpBtn);
+controlPanel.add(ui.Label(''));
+controlPanel.add(ui.Label('🗺️ Map Settings:', {fontWeight: 'bold'}));
+controlPanel.add(basemapLabel);
+controlPanel.add(basemapSelect);
+controlPanel.add(ui.Label(''));
+controlPanel.add(ui.Label('📍 Drawn Polygons:', {fontWeight: 'bold'}));
+controlPanel.add(polygonListPanel);
+controlPanel.add(ui.Label(''));
+controlPanel.add(controlsPanel);
+controlPanel.add(ui.Label(''));
+controlPanel.add(ui.Label('📊 Generate Charts:', {fontWeight: 'bold'}));
+controlPanel.add(allButtonsPanel1);
+controlPanel.add(statButtonPanel);
+controlPanel.add(ui.Label(''));
+controlPanel.add(ui.Label('🎨 Multi-Polygon View:', {fontWeight: 'bold'}));
+controlPanel.add(visualizeAllBtn);
+controlPanel.add(ui.Label(''));
+controlPanel.add(utilityButtonPanel);
+controlPanel.add(ui.Label(''));
+controlPanel.add(infoLabel);
+
+ui.root.add(controlPanel);
+
+// ================================
+// 12. EVENT LISTENERS
+// ================================
+
+yearSlider.onChange(updateVisualization);
+seasonSelect.onChange(updateVisualization);
+variableSelect.onChange(updateVisualization);
+polygonSelect.onChange(function(polygonId) {
+  selectedPolygonId = polygonId;
+  updateVisualization();
+});
+
+// ================================
+// 13. INITIALIZE MAP AND VIEW
+// ================================
+
+Map.setCenter(12.5, 42.0, 6); // Italy center
+Map.setOptions('HYBRID');
+
+updatePolygonList();
+
+// ================================
+// 14. INITIALIZE APP
+// ================================
+
+// Display initial welcome message
+updateAppMessage('🌍 Enhanced MODIS Analysis Tool Ready!\nClick "ℹ️ Help & Info" for detailed instructions or "📍 Drawing Instructions" to get started.');
